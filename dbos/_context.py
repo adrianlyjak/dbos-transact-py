@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from contextlib import AbstractContextManager
@@ -7,7 +8,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 from types import TracebackType
-from typing import TYPE_CHECKING, List, Literal, Optional, Type, TypedDict
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Type, TypedDict
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span
@@ -18,6 +19,95 @@ from dbos._utils import GlobalParams, generate_uuid
 
 from ._logger import dbos_logger
 from ._tracer import dbos_tracer
+
+
+class ReplayResolutionCoordinator:
+    """Ensures steps resolve in function ID order during replay.
+
+    During replay, concurrent steps may complete their database lookups
+    in arbitrary order due to asyncio scheduling. This coordinator
+    ensures that steps resolve (i.e., their awaits complete) in the
+    order of their function IDs, providing deterministic behavior.
+
+    This coordinator is only used during replay; fresh execution
+    bypasses it entirely.
+
+    When a workflow is forked from a later step, earlier steps won't be
+    replaying. The coordinator handles this by waiting briefly for all
+    concurrent replaying steps to register, then only enforcing order
+    among registered steps.
+    """
+
+    # Time to wait for all concurrent steps to register before proceeding
+    _REGISTRATION_DELAY_SEC: float = 0.001  # 1ms
+
+    def __init__(self) -> None:
+        self._last_resolved: int = 0
+        self._waiters: Dict[int, asyncio.Event] = {}
+        self._pending: set[int] = set()  # Function IDs registered for replay
+        self._lock: asyncio.Lock = asyncio.Lock()
+        self._registration_phase_done: bool = False
+
+    async def wait_for_turn(self, function_id: int) -> None:
+        """Block until it's this function ID's turn to resolve.
+
+        A function ID's turn comes when all lower function IDs that are
+        being replayed have resolved.
+        """
+        async with self._lock:
+            # Register that this function ID is participating in replay
+            self._pending.add(function_id)
+
+            # If we're the first, start the registration phase timer
+            if not self._registration_phase_done and len(self._pending) == 1:
+                # Release lock and wait briefly for other steps to register
+
+                async def complete_registration() -> None:
+                    await asyncio.sleep(self._REGISTRATION_DELAY_SEC)
+                    async with self._lock:
+                        self._registration_phase_done = True
+
+                asyncio.create_task(complete_registration())
+
+        # Wait for registration phase to complete
+        while not self._registration_phase_done:
+            await asyncio.sleep(0.0001)  # Yield to allow other coroutines
+
+        async with self._lock:
+            # Check if it's our turn: all lower registered IDs have resolved
+            lower_pending = [fid for fid in self._pending if fid < function_id]
+            if not lower_pending or all(
+                fid <= self._last_resolved for fid in lower_pending
+            ):
+                return  # Our turn
+
+            # Wait for our turn
+            event = asyncio.Event()
+            self._waiters[function_id] = event
+
+        await event.wait()
+
+    async def mark_resolved(self, function_id: int) -> None:
+        """Signal that this function ID has resolved.
+
+        This wakes up any waiting function IDs that are now unblocked.
+        """
+        async with self._lock:
+            self._last_resolved = max(self._last_resolved, function_id)
+
+            # Check which waiters are now unblocked
+            to_wake = []
+            for waiting_id, event in list(self._waiters.items()):
+                # A waiter is unblocked if all lower registered IDs have resolved
+                lower_pending = [fid for fid in self._pending if fid < waiting_id]
+                if not lower_pending or all(
+                    fid <= self._last_resolved for fid in lower_pending
+                ):
+                    to_wake.append(waiting_id)
+
+            for waiting_id in to_wake:
+                self._waiters[waiting_id].set()
+                del self._waiters[waiting_id]
 
 
 # These are used to tag OTel traces
@@ -122,6 +212,9 @@ class DBOSContext:
         # If the workflow is enqueued on a partitioned queue, its partition key
         self.queue_partition_key: Optional[str] = None
 
+        # Coordinator for deterministic step resolution during replay
+        self.replay_resolution_coordinator: Optional[ReplayResolutionCoordinator] = None
+
     def create_child(self, *, is_for_workflow: bool) -> DBOSContext:
         rv = DBOSContext()
         rv.logger = self.logger
@@ -151,6 +244,7 @@ class DBOSContext:
         rv.deduplication_id = self.deduplication_id
         rv.priority = self.priority
         rv.queue_partition_key = self.queue_partition_key
+        rv.replay_resolution_coordinator = self.replay_resolution_coordinator
         self.function_id += 1
         rv.function_id = self.function_id
         if reserve_sleep_id:
@@ -208,11 +302,14 @@ class DBOSContext:
             self.id_assigned_for_next_workflow = ""
         self.workflow_id = wfid
         self.function_id = 0
+        # Create a coordinator for deterministic resolution during replay
+        self.replay_resolution_coordinator = ReplayResolutionCoordinator()
         self._start_span(attributes)
 
     def end_workflow(self, exc_value: Optional[BaseException]) -> None:
         self.workflow_id = ""
         self.function_id = -1
+        self.replay_resolution_coordinator = None
         self._end_span(exc_value)
 
     def is_within_workflow(self) -> bool:

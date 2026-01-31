@@ -1281,12 +1281,17 @@ def invoke_step(
         dbos._sys_db.record_operation_result(step_output)
         return output
 
+    # Track whether this step is being replayed (for coordination)
+    is_replay = False
+
     def check_existing_result() -> Union[NoResult, R]:
+        nonlocal is_replay
         ctx = assert_current_dbos_context()
         recorded_output = dbos._sys_db.check_operation_execution(
             ctx.workflow_id, ctx.function_id, step_name
         )
         if recorded_output:
+            is_replay = True
             dbos.logger.debug(
                 f"Replaying step, id: {ctx.function_id}, name: {attributes['name']}"
             )
@@ -1318,7 +1323,29 @@ def invoke_step(
         .intercept(check_existing_result, dbos=dbos)
         .also(EnterDBOSStepCtx(attributes, step_ctx))
     )
-    return outcome()
+
+    # For async steps, wrap with coordination for deterministic replay ordering
+    if inspect.iscoroutinefunction(func):
+        coro = cast(Coroutine[Any, Any, R], outcome())
+
+        async def coordinated_step() -> R:
+            """Wrap async step with replay resolution coordination."""
+            coordinator = step_ctx.replay_resolution_coordinator
+            function_id = step_ctx.function_id
+            try:
+                result = await coro
+                # During replay only, wait for our turn before returning
+                if is_replay and coordinator is not None:
+                    await coordinator.wait_for_turn(function_id)
+                return result
+            finally:
+                # During replay only, mark as resolved
+                if is_replay and coordinator is not None:
+                    await coordinator.mark_resolved(function_id)
+
+        return coordinated_step()
+    else:
+        return outcome()
 
 
 def run_step(
